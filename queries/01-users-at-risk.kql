@@ -1,0 +1,98 @@
+// Title: Users at risk of sign-in disruption at retirement
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 1 - Assess
+// Tags: entra-id, sms, voice, retirement, passkey, risk, migration
+// Description: Users who completed MFA with SMS or voice and used no
+//   phishing-resistant or app-based method in the period. These are the
+//   accounts that face a blocking passkey registration prompt at their
+//   retirement date.
+// Data sources: SigninLogs
+// Parameters: StartTime, EndTime
+// Notes: Sign-in evidence shows what users actually USED. It cannot show what
+//   they are registered for. A user may hold an unused Authenticator
+//   registration and so be safe despite appearing here. Confirm against
+//   registration details before contacting anyone; see the README.
+
+let StartTime = ago(30d);
+let EndTime = now();
+SigninLogs
+| where TimeGenerated between (StartTime .. EndTime)
+// A failed prompt is not evidence of a usable method, so require the sign-in
+// to have succeeded as well as the individual authentication step.
+| where ResultType == "0"
+| where isnotempty(UserId)
+| where isnotempty(AuthenticationDetails)
+| mv-expand AuthStep = parse_json(AuthenticationDetails)
+| where tobool(AuthStep.succeeded) == true
+| extend RawMethod = trim(@"\s+", tostring(AuthStep.authenticationMethod))
+| where isnotempty(RawMethod)
+| extend MethodGroup = case(
+    RawMethod in~ ("Text message", "SMS"), "Retiring",
+    RawMethod in~ (
+        "Phone call approval (Authentication phone)",
+        "Phone call approval (Alternate phone)",
+        "Voice call"
+    ), "Retiring",
+    // Phishing-resistant: unaffected by the retirement and the target state.
+    RawMethod in~ (
+        "Windows Hello for Business",
+        "Windows Hello",
+        "FIDO2 security key",
+        "Fido Key",
+        "Passkey (device-bound)",
+        "Passkey",
+        "X.509 Certificate",
+        "Certificate-based authentication"
+    ), "PhishingResistant",
+    // App and code based: survives the retirement, but is not the target
+    // state. Users here are safe from disruption, not finished migrating.
+    RawMethod in~ (
+        "Mobile app notification",
+        "Companion mobile app notification",
+        "Passwordless Microsoft Authenticator",
+        "Passwordless phone sign-in",
+        "Microsoft Authenticator push notification",
+        "Mobile app verification code",
+        "OATH verification code",
+        "Hardware OATH token",
+        "Software OATH token"
+    ), "AppOrCode",
+    // Primary factor or a cached MFA claim: neither proves a usable method.
+    RawMethod in~ ("Password", "Previously satisfied"), "Primary",
+    "Unclassified"
+)
+// Aggregate across every group before filtering. Narrowing to SMS and voice
+// first would hide a user's stronger methods and report them as at risk.
+| summarize
+    RetiringSteps = countif(MethodGroup == "Retiring"),
+    PhishingResistantSteps = countif(MethodGroup == "PhishingResistant"),
+    AppOrCodeSteps = countif(MethodGroup == "AppOrCode"),
+    RetiringMethods = make_set_if(RawMethod, MethodGroup == "Retiring", 10),
+    UnclassifiedMethods = make_set_if(RawMethod, MethodGroup == "Unclassified", 10),
+    LastRetiringUse = maxif(TimeGenerated, MethodGroup == "Retiring"),
+    SignIns = dcount(Id),
+    UserPrincipalName = take_any(UserPrincipalName),
+    DisplayName = take_any(Identity),
+    UserType = take_any(UserType)
+    by UserId
+| where RetiringSteps > 0
+| where PhishingResistantSteps == 0 and AppOrCodeSteps == 0
+| extend Risk = case(
+    RetiringSteps >= 20, "High - frequent reliance",
+    RetiringSteps >= 5, "Medium",
+    "Low - occasional use"
+)
+| project
+    UserPrincipalName,
+    DisplayName,
+    UserType,
+    Risk,
+    RetiringMethods,
+    RetiringSteps,
+    SignIns,
+    LastRetiringUse,
+    // Any value here means the classification above needs extending. Treat it
+    // as unknown, never as confirmation that the user is at risk.
+    UnclassifiedMethods,
+    UserId
+| order by RetiringSteps desc

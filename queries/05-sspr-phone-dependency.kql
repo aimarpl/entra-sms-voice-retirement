@@ -1,0 +1,56 @@
+// Title: Password reset depending on SMS or voice
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 1 - Assess
+// Tags: entra-id, sms, voice, retirement, sspr, password-reset, helpdesk
+// Description: Self-service password reset activity that used a phone-based
+//   method. The retirement applies across Entra including SSPR, so these
+//   users lose their reset path even if their sign-in method is already
+//   migrated.
+// Data sources: AuditLogs
+// Parameters: StartTime, EndTime
+// Notes: Easy to miss, because it does not appear in SigninLogs at all. A
+//   user who signs in with a passkey but whose only SSPR method is SMS will
+//   still be locked out of self-service reset.
+//
+//   AuditLogs schema for SSPR varies by tenant and changes over time. Run the
+//   discovery query in the README first and adjust the method extraction
+//   below to match what your tenant actually records.
+
+let StartTime = ago(30d);
+let EndTime = now();
+AuditLogs
+| where TimeGenerated between (StartTime .. EndTime)
+| where LoggedByService in~ ("Self-service Password Management", "SSPR")
+    or OperationName has_any (
+        "Self-serve password reset",
+        "Reset password (self-service)",
+        "User registered for self-service password reset"
+    )
+| extend Detail = tostring(ResultReason)
+| extend TargetUpn = tostring(TargetResources[0].userPrincipalName)
+| extend TargetId = tostring(TargetResources[0].id)
+// Phone-based SSPR records the channel in free text rather than a dedicated
+// column, so match on the text and keep the raw value for verification.
+| extend UsedPhoneMethod = Detail has_any (
+    "PhoneAppNotification", "OneWaySMS", "TwoWayVoiceMobile",
+    "TwoWayVoiceOffice", "TwoWayVoiceAlternateMobile",
+    "SMS", "Text message", "Voice call", "Phone"
+)
+| where UsedPhoneMethod
+| summarize
+    Attempts = count(),
+    Successes = countif(ResultDescription has_any ("success", "Success") or Result == "success"),
+    Operations = make_set(OperationName, 10),
+    // Keep the raw reason so the matching above can be audited and corrected.
+    SampleDetail = take_any(Detail),
+    LastAttempt = max(TimeGenerated)
+    by TargetUpn, TargetId
+| project
+    UserPrincipalName = TargetUpn,
+    Attempts,
+    Successes,
+    Operations,
+    SampleDetail,
+    LastAttempt,
+    UserId = TargetId
+| order by Attempts desc

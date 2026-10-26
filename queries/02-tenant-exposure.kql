@@ -1,0 +1,73 @@
+// Title: Retiring method usage and tenant exposure
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 1 - Assess
+// Tags: entra-id, sms, voice, retirement, exposure, reporting
+// Description: Headline exposure figures: how many users and sign-ins still
+//   depend on SMS or voice, and what share of the active population that is.
+//   Use it to size the migration and to report progress to stakeholders.
+// Data sources: SigninLogs
+// Parameters: StartTime, EndTime
+// Notes: Any non-zero result means the tenant is in scope for the retirement.
+
+let StartTime = ago(30d);
+let EndTime = now();
+let ActiveUsers = toscalar(
+    SigninLogs
+    | where TimeGenerated between (StartTime .. EndTime)
+    | where ResultType == "0"
+    | where isnotempty(UserId)
+    | summarize dcount(UserId)
+);
+SigninLogs
+| where TimeGenerated between (StartTime .. EndTime)
+| where ResultType == "0"
+| where isnotempty(UserId)
+| where isnotempty(AuthenticationDetails)
+| mv-expand AuthStep = parse_json(AuthenticationDetails)
+| where tobool(AuthStep.succeeded) == true
+| extend RawMethod = trim(@"\s+", tostring(AuthStep.authenticationMethod))
+| where isnotempty(RawMethod)
+| extend MethodGroup = case(
+    RawMethod in~ ("Text message", "SMS"), "SMS",
+    RawMethod in~ (
+        "Phone call approval (Authentication phone)",
+        "Phone call approval (Alternate phone)",
+        "Voice call"
+    ), "Voice",
+    RawMethod in~ (
+        "Windows Hello for Business", "Windows Hello", "FIDO2 security key",
+        "Fido Key", "Passkey (device-bound)", "Passkey", "X.509 Certificate",
+        "Certificate-based authentication"
+    ), "Phishing-resistant",
+    RawMethod in~ (
+        "Mobile app notification", "Companion mobile app notification",
+        "Passwordless Microsoft Authenticator", "Passwordless phone sign-in",
+        "Microsoft Authenticator push notification",
+        "Mobile app verification code", "OATH verification code",
+        "Hardware OATH token", "Software OATH token"
+    ), "App or code",
+    RawMethod in~ ("Password", "Previously satisfied"), "Primary factor",
+    strcat("Unclassified: ", RawMethod)
+)
+| summarize
+    Users = dcount(UserId),
+    SuccessfulSteps = count(),
+    SignIns = dcount(Id),
+    LastUse = max(TimeGenerated)
+    by MethodGroup
+| extend
+    ShareOfActiveUsers = round(100.0 * Users / ActiveUsers, 1),
+    RetiresOn = case(
+        MethodGroup in ("SMS", "Voice"),
+            "1 Feb 2027 (Global Admins and external users: 1 Jul 2027)",
+        "Not affected"
+    )
+| project
+    MethodGroup,
+    Users,
+    ShareOfActiveUsers,
+    SuccessfulSteps,
+    SignIns,
+    LastUse,
+    RetiresOn
+| order by Users desc

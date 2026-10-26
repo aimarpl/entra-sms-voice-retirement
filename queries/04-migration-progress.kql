@@ -1,0 +1,71 @@
+// Title: Migration progress over time
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 3 - Verify
+// Tags: entra-id, sms, voice, retirement, progress, trend, reporting
+// Description: Weekly trend of users relying on retiring methods against
+//   users on phishing-resistant methods. Use it to show whether the
+//   migration is actually moving and to forecast against the deadline.
+// Data sources: SigninLogs
+// Parameters: StartTime, EndTime, Bin
+// Notes: Counts users by what they used in each bucket, so a user can appear
+//   in both series during transition. That overlap is the migration itself
+//   and is expected; RetiringOnly is the number that must reach zero.
+
+let StartTime = ago(90d);
+let EndTime = now();
+let Bin = 7d;
+SigninLogs
+| where TimeGenerated between (StartTime .. EndTime)
+| where ResultType == "0"
+| where isnotempty(UserId)
+| where isnotempty(AuthenticationDetails)
+| mv-expand AuthStep = parse_json(AuthenticationDetails)
+| where tobool(AuthStep.succeeded) == true
+| extend RawMethod = trim(@"\s+", tostring(AuthStep.authenticationMethod))
+| where isnotempty(RawMethod)
+| extend MethodGroup = case(
+    RawMethod in~ (
+        "Text message", "SMS",
+        "Phone call approval (Authentication phone)",
+        "Phone call approval (Alternate phone)",
+        "Voice call"
+    ), "Retiring",
+    RawMethod in~ (
+        "Windows Hello for Business", "Windows Hello", "FIDO2 security key",
+        "Fido Key", "Passkey (device-bound)", "Passkey", "X.509 Certificate",
+        "Certificate-based authentication"
+    ), "PhishingResistant",
+    RawMethod in~ (
+        "Mobile app notification", "Companion mobile app notification",
+        "Passwordless Microsoft Authenticator", "Passwordless phone sign-in",
+        "Microsoft Authenticator push notification",
+        "Mobile app verification code", "OATH verification code",
+        "Hardware OATH token", "Software OATH token"
+    ), "AppOrCode",
+    RawMethod in~ ("Password", "Previously satisfied"), "Primary",
+    "Unclassified"
+)
+| extend Week = bin(TimeGenerated, Bin)
+// Establish each user's strongest method per week before counting, so that a
+// user who has migrated is not still counted against the retiring total.
+| summarize
+    UsedRetiring = countif(MethodGroup == "Retiring") > 0,
+    UsedPhishingResistant = countif(MethodGroup == "PhishingResistant") > 0,
+    UsedAppOrCode = countif(MethodGroup == "AppOrCode") > 0,
+    // An unrecognised method might be a new strong method. Counting such a
+    // user as at risk would repeat the false positive this layout avoids.
+    UsedUnclassified = countif(MethodGroup == "Unclassified") > 0
+    by Week, UserId
+| summarize
+    RetiringOnly = countif(UsedRetiring and not(UsedPhishingResistant) and not(UsedAppOrCode) and not(UsedUnclassified)),
+    RetiringInTransition = countif(UsedRetiring and (UsedPhishingResistant or UsedAppOrCode)),
+    PhishingResistant = countif(UsedPhishingResistant),
+    AppOrCodeOnly = countif(UsedAppOrCode and not(UsedPhishingResistant) and not(UsedRetiring)),
+    // Non-zero means the method lists need extending before the RetiringOnly
+    // figure can be trusted as complete.
+    NeedsReview = countif(UsedRetiring and UsedUnclassified and not(UsedPhishingResistant) and not(UsedAppOrCode)),
+    ActiveUsers = dcount(UserId)
+    by Week
+| extend PercentAtRisk = round(100.0 * RetiringOnly / ActiveUsers, 1)
+| order by Week asc
+| render timechart with (title="Users relying only on retiring methods")

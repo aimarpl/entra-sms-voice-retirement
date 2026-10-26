@@ -1,0 +1,84 @@
+// Title: Global Administrators and external users on retiring methods
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 1 - Assess
+// Tags: entra-id, sms, voice, retirement, privileged-access, guest, external
+// Description: Separates the population that retires on 1 July 2027 from the
+//   main 1 February 2027 group, and flags privileged sign-ins that still
+//   depend on SMS or voice.
+// Data sources: SigninLogs
+// Parameters: StartTime, EndTime, PrivilegedApps
+// Notes: Entra gives Global Administrators and external users until
+//   1 July 2027. Internal guests are NOT in that group and retire on
+//   1 February 2027 with everyone else, which is easy to get wrong.
+//
+//   SigninLogs has no role column, so directory role membership cannot be
+//   read here. This query identifies external users reliably from UserType
+//   and flags likely-privileged activity by the application signed in to.
+//   Confirm actual Global Administrators in Entra, or with Microsoft Graph.
+
+let StartTime = ago(30d);
+let EndTime = now();
+// Sign-ins to these applications suggest administrative activity. Adjust to
+// match the consoles your administrators actually use.
+let PrivilegedApps = dynamic([
+    "Microsoft Azure PowerShell",
+    "Microsoft Azure CLI",
+    "Azure Active Directory PowerShell",
+    "Microsoft Graph PowerShell",
+    "Microsoft Azure Portal",
+    "Azure portal",
+    "Microsoft Entra admin center",
+    "Microsoft 365 admin center",
+    "Microsoft Intune"
+]);
+SigninLogs
+| where TimeGenerated between (StartTime .. EndTime)
+| where ResultType == "0"
+| where isnotempty(UserId)
+| where isnotempty(AuthenticationDetails)
+| mv-expand AuthStep = parse_json(AuthenticationDetails)
+| where tobool(AuthStep.succeeded) == true
+| extend RawMethod = trim(@"\s+", tostring(AuthStep.authenticationMethod))
+| where RawMethod in~ (
+    "Text message", "SMS",
+    "Phone call approval (Authentication phone)",
+    "Phone call approval (Alternate phone)",
+    "Voice call"
+)
+| extend IsPrivilegedApp = AppDisplayName in~ (PrivilegedApps)
+| summarize
+    RetiringSteps = count(),
+    RetiringMethods = make_set(RawMethod, 10),
+    PrivilegedAppSignIns = countif(IsPrivilegedApp),
+    AppsUsed = make_set_if(AppDisplayName, IsPrivilegedApp, 10),
+    LastUse = max(TimeGenerated),
+    UserPrincipalName = take_any(UserPrincipalName),
+    DisplayName = take_any(Identity),
+    UserType = take_any(UserType)
+    by UserId
+// External users are identified by UserType = Guest. Internal guests are
+// indistinguishable from external guests in this table, so verify the
+// population in Entra before relying on the later date for anyone.
+| extend Population = case(
+    UserType =~ "Guest", "External or guest - verify July cohort in Entra",
+    PrivilegedAppSignIns > 0, "Possibly privileged - confirm role in Entra",
+    "Standard user - retires 1 Feb 2027"
+)
+| extend RetirementDate = case(
+    UserType =~ "Guest", "1 Jul 2027 if external; 1 Feb 2027 if internal guest",
+    PrivilegedAppSignIns > 0, "1 Jul 2027 if Global Administrator, else 1 Feb 2027",
+    "1 Feb 2027"
+)
+| project
+    UserPrincipalName,
+    DisplayName,
+    UserType,
+    Population,
+    RetirementDate,
+    RetiringMethods,
+    RetiringSteps,
+    PrivilegedAppSignIns,
+    AppsUsed,
+    LastUse,
+    UserId
+| order by PrivilegedAppSignIns desc, RetiringSteps desc
