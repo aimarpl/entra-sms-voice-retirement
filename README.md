@@ -33,9 +33,13 @@ configured through Microsoft Security Store; see the Microsoft guidance below.
 | 02 | [tenant-exposure](queries/02-tenant-exposure.kql) | Assess | How big is the problem, and is this tenant in scope at all? |
 | 03 | [privileged-and-external-users](queries/03-privileged-and-external-users.kql) | Assess | Who falls under the July date, and are any admins affected? |
 | 05 | [sspr-phone-dependency](queries/05-sspr-phone-dependency.kql) | Assess | Who loses self-service password reset? |
+| 06 | [exception-group-sms-voice-only](queries/06-exception-group-sms-voice-only.kql) | Migrate | Who must stay in the SMS and voice exception group, and when and where did they last use it? |
 | 04 | [migration-progress](queries/04-migration-progress.kql) | Verify | Is the migration actually moving? |
 
-Start with **02** to size the problem, then **01** for the worklist.
+Start with **02** to size the problem, then **01** for the worklist. When you
+switch SMS and voice off for everyone except an exception group, **06** lists
+the users who must stay in that group: their only successful MFA in the last
+90 days was SMS or voice.
 
 ## How to run
 
@@ -44,7 +48,13 @@ sign-in logs. In the Entra admin center, the diagnostic settings must export
 `SignInLogs` (and `AuditLogs` for query 05).
 
 Each query declares its parameters as `let` statements at the top. Adjust the
-time range there; the default is the last 30 days.
+time range there; the default is the last 30 days, or 90 days for queries 04
+and 06. A 90-day range needs at least 90 days of `SigninLogs` retention in the
+workspace.
+
+Query 06 reads the account's country from `IdentityInfo` when Microsoft
+Sentinel UEBA is enabled. Without it the query still runs, and only the
+sign-in location country is filled in.
 
 Queries are plain `.kql` files. Paste one into the query window and run it.
 

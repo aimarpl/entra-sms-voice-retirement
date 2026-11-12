@@ -1,0 +1,139 @@
+// Title: Users who still need SMS or voice (exception group list)
+// Platform: Microsoft Sentinel / Log Analytics
+// Phase: 2 - Migrate
+// Tags: entra-id, sms, voice, retirement, exception-group, migration, country
+// Description: Users whose only successful MFA in the period was SMS or voice.
+//   Anyone who completed MFA at least once with Microsoft Authenticator, a
+//   passkey or FIDO2 key, Windows Hello for Business, a certificate or an
+//   OATH code has another working method and is not listed. Use it when SMS
+//   and voice are switched off for everyone except an exception group: the
+//   users returned here must stay in that group, or they lose MFA.
+// Data sources: SigninLogs; IdentityInfo (optional, Microsoft Sentinel UEBA)
+// Parameters: StartTime, EndTime, IdentityLookback
+// Notes: The default period is 90 days, so the workspace must keep SigninLogs
+//   that long. Check with `SigninLogs | summarize min(TimeGenerated)`; with
+//   shorter retention the query silently covers less.
+//
+//   Sign-in logs show what users USED, not what they are registered for. A
+//   user listed here may hold an unused Authenticator registration. Confirm
+//   against registration data before removing anyone from the exception
+//   group, and before contacting users; see the README.
+//
+//   Country: DirectoryCountry is the country attribute of the account, read
+//   from IdentityInfo. It is empty when UEBA is not enabled. LastUseCountry is
+//   where the last SMS or voice sign-in came from (IP geolocation), and
+//   SignInCountries lists every country seen for those sign-ins.
+//
+//   NeedsReview = true means the user also used a method this query does not
+//   recognise. It may be a strong method, so check before relying on the row.
+
+let StartTime = ago(90d);
+let EndTime = now();
+// How far back to look for the latest IdentityInfo snapshot of each account.
+let IdentityLookback = 14d;
+// Directory attributes from IdentityInfo. Workspaces without UEBA have no such
+// table; isfuzzy drops that leg and the empty datatable keeps the query valid.
+let DirectoryInfo = union isfuzzy=true
+    (
+        IdentityInfo
+        | where TimeGenerated > ago(IdentityLookback)
+        | where isnotempty(AccountObjectId)
+        | summarize arg_max(TimeGenerated, Country) by AccountObjectId
+        | project UserId = tostring(AccountObjectId), DirectoryCountry = tostring(Country)
+    ),
+    (datatable(UserId: string, DirectoryCountry: string) [])
+| summarize DirectoryCountry = take_any(DirectoryCountry) by UserId;
+let Steps = materialize(
+    SigninLogs
+    | where TimeGenerated between (StartTime .. EndTime)
+    // A failed prompt is not evidence of a usable method, so require the
+    // sign-in to have succeeded as well as the individual step.
+    | where ResultType == "0"
+    | where isnotempty(UserId)
+    | where isnotempty(AuthenticationDetails)
+    | mv-expand AuthStep = parse_json(AuthenticationDetails)
+    | where tobool(AuthStep.succeeded) == true
+    | extend RawMethod = trim(@"\s+", tostring(AuthStep.authenticationMethod))
+    | where isnotempty(RawMethod)
+    | extend MethodGroup = case(
+        RawMethod in~ ("Text message", "SMS"), "SMS",
+        RawMethod in~ (
+            "Phone call approval (Authentication phone)",
+            "Phone call approval (Alternate phone)",
+            "Voice call"
+        ), "Voice",
+        RawMethod in~ (
+            "Windows Hello for Business",
+            "Windows Hello",
+            "FIDO2 security key",
+            "Fido Key",
+            "Passkey (device-bound)",
+            "Passkey",
+            "X.509 Certificate",
+            "Certificate-based authentication"
+        ), "PhishingResistant",
+        RawMethod in~ (
+            "Mobile app notification",
+            "Companion mobile app notification",
+            "Passwordless Microsoft Authenticator",
+            "Passwordless phone sign-in",
+            "Microsoft Authenticator push notification",
+            "Mobile app verification code",
+            "OATH verification code",
+            "Hardware OATH token",
+            "Software OATH token"
+        ), "AppOrCode",
+        // Primary factor or a cached MFA claim: neither proves another method.
+        RawMethod in~ ("Password", "Previously satisfied"), "Primary",
+        "Unclassified"
+    )
+    | extend IsRetiring = MethodGroup in ("SMS", "Voice")
+    | extend SignInCountry = coalesce(tostring(LocationDetails.countryOrRegion), Location)
+    | project TimeGenerated, Id, UserId, UserPrincipalName, Identity, UserType, RawMethod, MethodGroup, IsRetiring, SignInCountry
+);
+// Country of the most recent SMS or voice step per user.
+let LastRetiringCountry = Steps
+    | where IsRetiring
+    | summarize arg_max(TimeGenerated, SignInCountry) by UserId
+    | project UserId, LastUseCountry = SignInCountry;
+Steps
+// Aggregate every method before filtering. Narrowing to SMS and voice first
+// would hide a user's other methods and keep them in the exception group.
+| summarize
+    SmsSteps = countif(MethodGroup == "SMS"),
+    VoiceSteps = countif(MethodGroup == "Voice"),
+    OtherMfaSteps = countif(MethodGroup in ("PhishingResistant", "AppOrCode")),
+    RetiringMethods = make_set_if(RawMethod, IsRetiring, 10),
+    UnclassifiedMethods = make_set_if(RawMethod, MethodGroup == "Unclassified", 10),
+    LastSmsVoiceUse = maxif(TimeGenerated, IsRetiring),
+    FirstSmsVoiceUse = minif(TimeGenerated, IsRetiring),
+    SignInCountries = make_set_if(SignInCountry, IsRetiring and isnotempty(SignInCountry), 10),
+    SmsVoiceSignIns = dcountif(Id, IsRetiring),
+    UserPrincipalName = take_any(UserPrincipalName),
+    DisplayName = take_any(Identity),
+    UserType = take_any(UserType)
+    by UserId
+| where SmsSteps + VoiceSteps > 0
+| where OtherMfaSteps == 0
+| extend NeedsReview = array_length(UnclassifiedMethods) > 0
+| join kind=leftouter LastRetiringCountry on UserId
+| join kind=leftouter DirectoryInfo on UserId
+| project
+    UserPrincipalName,
+    DisplayName,
+    UserType,
+    DirectoryCountry,
+    LastUseCountry,
+    SignInCountries,
+    LastSmsVoiceUse,
+    FirstSmsVoiceUse,
+    RetiringMethods,
+    SmsSteps,
+    VoiceSteps,
+    SmsVoiceSignIns,
+    // Any value here means the classification above needs extending. Treat
+    // the row as unknown until checked, never as confirmed SMS-only.
+    NeedsReview,
+    UnclassifiedMethods,
+    UserId
+| order by LastSmsVoiceUse desc
