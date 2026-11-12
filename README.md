@@ -1,5 +1,9 @@
 # Entra SMS and voice retirement
 
+[![KQL](https://img.shields.io/badge/KQL-Microsoft%20Sentinel-0078D4?logo=microsoftazure&logoColor=white)](https://learn.microsoft.com/kusto/query/)
+[![CI](https://github.com/aimarpl/entra-sms-voice-retirement/actions/workflows/quality.yml/badge.svg)](https://github.com/aimarpl/entra-sms-voice-retirement/actions/workflows/quality.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 KQL queries for finding and reducing dependency on SMS and voice
 authentication in Microsoft Entra ID, ahead of their retirement.
 
